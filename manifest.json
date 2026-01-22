@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Episode Countdown",
+  "description": "Track your favorite TV shows, Anime, and Movies with a beautiful next-episode countdown interface.",
+  "version": "1.0.1",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Episode Countdown"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "alarms",
+    "identity",
+    "identity.email"
+  ],
+  "host_permissions": [
+    "https://api.tvmaze.com/*",
+    "https://query.wikidata.org/*",
+    "https://www.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}

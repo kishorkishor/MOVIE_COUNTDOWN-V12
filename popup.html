@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Show Tracker</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="popup-root">
+      <header class="top-bar">
+        <div class="top-bar-left">
+          <div class="top-logo">K</div>
+        </div>
+        <button id="user-btn" class="top-user-icon" aria-label="User profile"></button>
+        
+        <!-- Profile Menu -->
+        <div id="profile-menu" class="profile-menu" style="display: none;">
+          <div class="profile-menu-content">
+            <div id="profile-menu-header" class="profile-menu-header">
+              <span id="profile-menu-name">Profile</span>
+            </div>
+            <div class="profile-menu-divider"></div>
+            <button id="profile-export-btn" class="profile-menu-item">
+              <span>📥</span>
+              <span>Export Shows</span>
+            </button>
+            <button id="profile-import-btn" class="profile-menu-item">
+              <span>📤</span>
+              <span>Import Shows</span>
+            </button>
+            <input type="file" id="profile-import-file" accept=".json" style="display: none;" />
+            <div class="profile-menu-divider"></div>
+            <button id="profile-signin-btn" class="profile-menu-item">
+              <span>👤</span>
+              <span id="profile-signin-text">Sign In</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <!-- Navigation Tabs -->
+      <nav class="nav-tabs">
+        <button class="nav-tab active" data-view="my-shows">My Shows</button>
+        <button class="nav-tab" data-view="airing">Airing</button>
+        <button class="nav-tab" data-view="popular">Popular</button>
+      </nav>
+
+      <!-- Login Modal -->
+      <div id="login-modal" class="login-modal" style="display: none;">
+        <div class="login-modal-content">
+          <h3>Sign In with Google</h3>
+          <p>Sign in to sync your shows across devices</p>
+          <div class="login-modal-buttons" style="flex-direction: column; gap: 10px;">
+            <button id="google-signin-btn" class="login-btn" style="background: linear-gradient(135deg, #4285f4, #34a853); display: flex; align-items: center; justify-content: center; gap: 8px;">
+              <span>🔵</span>
+              <span>Sign in with Google</span>
+            </button>
+            <button id="login-cancel-btn" class="login-btn-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Import Confirmation Modal -->
+      <div id="import-modal" class="login-modal" style="display: none;">
+        <div class="login-modal-content">
+          <h3>Import Shows</h3>
+          <p id="import-modal-message">This will import shows. How would you like to proceed?</p>
+          <div class="login-modal-buttons" style="flex-direction: column; gap: 10px;">
+            <button id="import-merge-btn" class="login-btn" style="width: 100%;">Merge with existing</button>
+            <button id="import-replace-btn" class="login-btn" style="width: 100%; background: linear-gradient(135deg, #ef4444, #dc2626);">Replace all shows</button>
+            <button id="import-cancel-btn" class="login-btn-cancel" style="width: 100%;">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Logout Confirmation Modal -->
+      <div id="logout-modal" class="login-modal" style="display: none;">
+        <div class="login-modal-content">
+          <h3>Sign Out</h3>
+          <p>Your shows will still be saved. Are you sure you want to sign out?</p>
+          <div class="login-modal-buttons">
+            <button id="logout-confirm-btn" class="login-btn">Sign Out</button>
+            <button id="logout-cancel-btn" class="login-btn-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toast Notification -->
+      <div id="toast" class="toast" style="display: none;">
+        <span id="toast-message"></span>
+      </div>
+
+      <!-- Custom Link Modal -->
+      <div id="link-modal" class="login-modal" style="display: none;">
+        <div class="link-modal-content">
+          <h3>🔗 Add Watch Link</h3>
+          <p class="link-modal-show-name" id="link-modal-show-name">Show Name</p>
+          <div class="link-input-wrapper">
+            <input type="url" id="link-input" placeholder="https://netflix.com/title/..." />
+          </div>
+          <p style="font-size: 11px; opacity: 0.6; margin: 0;">Paste a link to where you watch this show</p>
+          <div class="link-modal-buttons">
+            <button id="link-save-btn" class="link-save-btn">Save Link</button>
+            <button id="link-remove-btn" class="link-remove-btn">Remove</button>
+            <button id="link-cancel-btn" class="login-btn-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <main class="popup-main">
+        <section id="search-section" class="search-panel">
+          <div class="search-shell">
+            <span class="search-icon" aria-hidden="true">🔍</span>
+            <input
+              id="search-input"
+              type="text"
+              placeholder="Search TV show…"
+              class="search-input"
+            />
+            <button
+              id="clear-search-btn"
+              class="search-clear-button"
+              aria-label="Clear search"
+            >
+              ✕
+            </button>
+            <button id="search-btn" class="search-icon-button" aria-label="Search"></button>
+          </div>
+          <div id="search-results" class="search-results"></div>
+        </section>
+
+        <section aria-label="Tracked shows" class="shows-section">
+          <!-- Content Type Toggles (for Popular and Airing views) -->
+          <div id="content-type-toggles" class="content-type-toggles" style="display: none;">
+            <button class="content-type-btn active" data-type="tv">TV Shows</button>
+            <button class="content-type-btn" data-type="movies">Movies</button>
+          </div>
+          
+          <!-- Genre Filters (for Popular view) -->
+          <div id="genre-filters" class="genre-filters" style="display: none;">
+            <div class="genre-filters-label">Filter by genre:</div>
+            <div id="genre-filters-list" class="genre-filters-list"></div>
+          </div>
+          
+          <div class="shows-header">
+            <span class="section-title">Your shows</span>
+            <div class="filters-row">
+              <select id="status-filter" class="status-filter">
+                <option value="all">All</option>
+                <option value="Running">Running</option>
+                <option value="Ended">Ended</option>
+              </select>
+              <select id="sort-select" class="sort-select">
+                <option value="soonest">Soonest first</option>
+                <option value="alpha">A–Z</option>
+              </select>
+            </div>
+          </div>
+          <div id="shows-container" class="shows-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>
+
+
