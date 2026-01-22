@@ -21,6 +21,10 @@ import {
   getApiGenre
 } from "./genreMapping.js";
 
+const SUPABASE_URL = "https://gbenfdbycwopvdcuoxde.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdiZW5mZGJ5Y3dvcHZkY3VveGRlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkwNjY5OTEsImV4cCI6MjA4NDY0Mjk5MX0.y1JQrSuD3k3ZDuYcPIMjKmTWcEOx1R-2yz4B8UHF7Uw";
+const SUPABASE_SESSION_KEY = "supabaseSession";
+
 const SAMPLE_SHOWS = [
   {
     id: "sample-1",
@@ -62,9 +66,9 @@ let hasMorePopular = true; // Whether there are more popular shows to load
 let cachedAiringShows = []; // Cached airing shows for the current content type
 let cachedPopularShows = []; // Cached popular shows for the current content type
 
-// Storage helper - user-specific storage that syncs across devices
-// Uses chrome.storage.sync for cross-device sync (tied to Chrome account)
-// Falls back to local storage if sync fails
+// Storage helper - user-specific storage
+// Supabase handles cross-device sync; local storage is for full data cache
+// Falls back to local storage if remote is unavailable
 async function getStorageData(keys) {
   try {
     // Try sync first (for cross-device sync)
@@ -84,6 +88,163 @@ async function getStorageData(keys) {
   }
 }
 
+function isSupabaseConfigured() {
+  return Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+}
+
+function isSupabaseUser(user) {
+  return Boolean(user && user.source === "supabase" && user.userId);
+}
+
+function decodeJwtPayload(token) {
+  try {
+    const base64Url = token.split(".")[1];
+    if (!base64Url) return null;
+    const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+    const jsonPayload = decodeURIComponent(
+      atob(base64)
+        .split("")
+        .map((c) => `%${`00${c.charCodeAt(0).toString(16)}`.slice(-2)}`)
+        .join("")
+    );
+    return JSON.parse(jsonPayload);
+  } catch (err) {
+    console.error("[decodeJwtPayload] Failed:", err);
+    return null;
+  }
+}
+
+async function getStoredSession() {
+  const data = await chrome.storage.local.get(SUPABASE_SESSION_KEY);
+  return data[SUPABASE_SESSION_KEY] || null;
+}
+
+async function setStoredSession(session) {
+  await chrome.storage.local.set({ [SUPABASE_SESSION_KEY]: session });
+}
+
+async function clearStoredSession() {
+  await chrome.storage.local.remove(SUPABASE_SESSION_KEY);
+}
+
+function isSessionValid(session) {
+  if (!session || !session.access_token) return false;
+  const payload = decodeJwtPayload(session.access_token);
+  if (!payload?.exp) return true;
+  return Date.now() < payload.exp * 1000;
+}
+
+function getSessionUserId(session) {
+  if (!session?.access_token) return null;
+  const payload = decodeJwtPayload(session.access_token);
+  return payload?.sub || null;
+}
+
+async function fetchSupabaseUser(session) {
+  if (!session?.access_token) return null;
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`
+    }
+  });
+  if (!response.ok) {
+    console.warn("[fetchSupabaseUser] Failed:", response.status);
+    return null;
+  }
+  return response.json();
+}
+
+function buildSupabaseUser(supabaseUser) {
+  if (!supabaseUser) return null;
+  const metadata = supabaseUser.user_metadata || {};
+  return {
+    name: metadata.full_name || metadata.name || supabaseUser.email || "User",
+    email: supabaseUser.email || null,
+    picture: metadata.avatar_url || metadata.picture || null,
+    googleId: null,
+    userId: supabaseUser.id,
+    token: null,
+    source: "supabase"
+  };
+}
+
+function mapShowsToSupabaseRows(userId, shows) {
+  return shows.map(show => ({
+    user_id: userId,
+    show_id: String(show.id),
+    name_short: (show.name || "").slice(0, 15),
+    content_type: show.contentType || "tv",
+    watched: Boolean(show.watched),
+    priority: Boolean(show.priority),
+    updated_at: new Date().toISOString()
+  }));
+}
+
+function mapSupabaseRowsToMinimal(rows) {
+  return rows.map(row => {
+    const typeCode = row.content_type === "movies" ? "m" : (row.content_type === "anime" ? "a" : "t");
+    return [
+      row.show_id,
+      row.name_short || "Loading...",
+      typeCode,
+      row.watched ? 1 : 0,
+      row.priority ? 1 : 0
+    ];
+  });
+}
+
+async function fetchSupabaseShows(userId) {
+  if (!isSupabaseConfigured()) return { rows: [], error: "Supabase not configured" };
+  const session = await getStoredSession();
+  if (!isSessionValid(session)) return { rows: [], error: "No valid session" };
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:98',message:'fetchSupabaseShows start',data:{userId:userId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'S1'})}).catch(()=>{});
+  // #endregion
+  const url = new URL(`${SUPABASE_URL}/rest/v1/user_shows`);
+  url.searchParams.set("select", "show_id,name_short,content_type,watched,priority,updated_at");
+  url.searchParams.set("user_id", `eq.${userId}`);
+  const response = await fetch(url.toString(), {
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`
+    }
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    console.error("[fetchSupabaseShows] Error:", response.status, text);
+    return { rows: [], error: text || "Fetch failed" };
+  }
+  const data = await response.json();
+  return { rows: Array.isArray(data) ? data : [], error: null };
+}
+
+async function upsertSupabaseShows(userId, shows) {
+  if (!isSupabaseConfigured()) return { error: "Supabase not configured" };
+  const session = await getStoredSession();
+  if (!isSessionValid(session)) return { error: "No valid session" };
+  const rows = mapShowsToSupabaseRows(userId, shows);
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:120',message:'upsertSupabaseShows start',data:{userId:userId,rowCount:rows.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'S2'})}).catch(()=>{});
+  // #endregion
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/user_shows?on_conflict=user_id,show_id`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates"
+    },
+    body: JSON.stringify(rows)
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    console.error("[upsertSupabaseShows] Error:", response.status, text);
+    return { error: text || "Upsert failed" };
+  }
+  return { error: null };
+}
+
 async function setStorageData(data) {
   try {
     // Store in both sync (for cross-device) and local (backup)
@@ -100,7 +261,14 @@ async function setStorageData(data) {
 }
 
 function sanitizeUserKeyPart(value) {
-  return String(value).toLowerCase().replace(/[^a-z0-9]/g, "_");
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:102',message:'sanitizeUserKeyPart entry',data:{input:value},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
+  // #endregion
+  const result = String(value).toLowerCase().replace(/[^a-z0-9]/g, "_");
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:104',message:'sanitizeUserKeyPart exit',data:{input:value,output:result},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
+  // #endregion
+  return result;
 }
 
 function generateUserId() {
@@ -110,22 +278,46 @@ function generateUserId() {
   return `user_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function createGuestUser() {
+  const guestUserId = generateUserId();
+  return {
+    name: "Guest",
+    email: null,
+    picture: null,
+    googleId: null,
+    userId: guestUserId,
+    token: null,
+    source: "guest"
+  };
+}
+
+async function ensureGuestUser() {
+  const guest = createGuestUser();
+  await setCurrentUser(guest);
+  await setStorageData({ simpleUser: guest });
+  return guest;
+}
+
 // Get user-specific storage key for shows
 function getUserShowsKey(userOrEmail) {
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:121',message:'getUserShowsKey entry',data:{userOrEmail:typeof userOrEmail==='string'?userOrEmail:JSON.stringify(userOrEmail)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+  // #endregion
   if (!userOrEmail) return null;
+  let key = null;
   if (typeof userOrEmail === "string") {
-    return `shows_${sanitizeUserKeyPart(userOrEmail)}`;
+    key = `shows_${sanitizeUserKeyPart(userOrEmail)}`;
+  } else if (userOrEmail.email) {
+    key = `shows_${sanitizeUserKeyPart(userOrEmail.email)}`;
+  } else if (userOrEmail.googleId) {
+    key = `shows_google_${sanitizeUserKeyPart(userOrEmail.googleId)}`;
+  } else if (userOrEmail.userId) {
+    key = `shows_user_${sanitizeUserKeyPart(userOrEmail.userId)}`;
   }
-  if (userOrEmail.email) {
-    return `shows_${sanitizeUserKeyPart(userOrEmail.email)}`;
-  }
-  if (userOrEmail.googleId) {
-    return `shows_google_${sanitizeUserKeyPart(userOrEmail.googleId)}`;
-  }
-  if (userOrEmail.userId) {
-    return `shows_user_${sanitizeUserKeyPart(userOrEmail.userId)}`;
-  }
-  return null;
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:136',message:'getUserShowsKey exit',data:{key:key,email:typeof userOrEmail==='string'?userOrEmail:userOrEmail?.email},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+  // #endregion
+  return key;
 }
 
 function getUserMigrationKey(user) {
@@ -198,115 +390,146 @@ async function getUserShows(specificUser = null) {
       return [];
     }
 
-    const syncKey = `${userKey}_ids`;
     const localKey = userKey;
-    
     console.log(`[getUserShows] User: ${user?.email || user?.userId || "unknown"}`);
-    console.log(`[getUserShows] Sync key: ${syncKey}, Local key: ${localKey}`);
-
-    // Get synced show IDs
-    let syncData = {};
-    try {
-      syncData = await chrome.storage.sync.get(syncKey);
-      if (syncData[syncKey]) {
-        console.log(`[getUserShows] ✅ Found ${syncData[syncKey].length} shows in sync storage (${syncKey})`);
-      } else {
-        console.log(`[getUserShows] ⚠️ No sync data found for key: ${syncKey}`);
-        // Try to list all sync keys to debug
-        const allSync = await chrome.storage.sync.get(null);
-        const syncKeys = Object.keys(allSync).filter(k => k.includes('shows_') && k.includes('_ids'));
-        console.log(`[getUserShows] Available sync keys:`, syncKeys);
-      }
-    } catch (e) {
-      console.error("[getUserShows] Sync read failed:", e);
-    }
-
-    // Check for legacy mixed-case key if new key is empty
-    // (Fixes issue where data was stored with "User@Email.com" key instead of lowercase)
-    if (!syncData[syncKey] && user && user.email) {
-      const legacyKeyPart = String(user.email).replace(/[^a-zA-Z0-9]/g, "_");
-      const legacyKey = `shows_${legacyKeyPart}`;
-      const legacySyncKey = `${legacyKey}_ids`; // It might be under _ids or the raw key depending on when it was saved
-
-      // Try to find any legacy data
-      const legacyData = await chrome.storage.sync.get([legacyKey, legacySyncKey]);
-
-      if (legacyData[legacySyncKey]) {
-        // Found legacy minimal data, migrate it!
-        console.log("Migrating legacy sync IDs to new key...");
-        await chrome.storage.sync.set({ [syncKey]: legacyData[legacySyncKey] });
-        // Re-read with new key
-        syncData[syncKey] = legacyData[legacySyncKey];
-      } else if (legacyData[legacyKey]) {
-        // Found legacy FULL data (really old), migrate to local + sync minimal
-        console.log("Migrating legacy full data to new format...");
-        const fullLegacyShows = legacyData[legacyKey];
-        if (Array.isArray(fullLegacyShows)) {
-          await saveUserShows(fullLegacyShows, user); // This will save to local + minimal sync
-          // Since we just saved, we can return these
-          return fullLegacyShows;
-        }
-      }
-    }
-
     // Get full local data
     const localData = await chrome.storage.local.get(localKey);
     const localShows = Array.isArray(localData[localKey]) ? localData[localKey] : [];
     console.log(`[getUserShows] Local shows: ${localShows.length}`);
 
+    let syncedIds = [];
+    if (isSupabaseUser(user) && isSupabaseConfigured()) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:235',message:'getUserShows supabase fetch start',data:{userId:user.userId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'S3'})}).catch(()=>{});
+      // #endregion
+        const session = await getStoredSession();
+        const userId = user.userId || getSessionUserId(session);
+        const { rows, error } = await fetchSupabaseShows(userId);
+      if (error) {
+        console.warn("[getUserShows] Supabase fetch failed, falling back to local:", error);
+      } else if (rows.length === 0 && localShows.length > 0) {
+        console.log("[getUserShows] Supabase empty, pushing local shows to remote...");
+        await upsertSupabaseShows(user.userId, localShows);
+      } else if (rows.length > 0) {
+        syncedIds = mapSupabaseRowsToMinimal(rows);
+      } else if (rows.length === 0 && localShows.length === 0) {
+        const legacySyncKey = `${userKey}_ids`;
+        const legacySync = await chrome.storage.sync.get(legacySyncKey);
+        if (Array.isArray(legacySync[legacySyncKey]) && legacySync[legacySyncKey].length > 0) {
+          console.log("[getUserShows] Found legacy sync data, rebuilding and migrating...");
+          syncedIds = legacySync[legacySyncKey];
+        }
+      }
+    }
+
     // If we have synced IDs but no local data, we need to rebuild from API
-    const syncedIds = syncData[syncKey];
     if (Array.isArray(syncedIds) && syncedIds.length > 0) {
       const localShowIds = new Set(localShows.map(s => String(s.id)));
-      const missingIds = syncedIds.filter(item => !localShowIds.has(String(item.id)));
+      // Handle both old format (object) and new format (array)
+      const missingIds = syncedIds.filter(item => {
+        const itemId = Array.isArray(item) ? String(item[0]) : String(item.id);
+        return !localShowIds.has(itemId);
+      });
 
       if (missingIds.length > 0) {
         console.log(`[getUserShows] 🔄 Rebuilding ${missingIds.length} shows from sync (local: ${localShows.length}, sync: ${syncedIds.length})...`);
         // Rebuild missing shows from synced minimal data
         // User will see these and they'll be refreshed immediately
-        const rebuiltShows = missingIds.map(item => ({
-          id: item.id,
-          name: item.n || "Loading...",
-          contentType: item.t || "tv",
-          image: null,
-          genres: [],
-          status: "Unknown",
-          summary: "",
-          nextEpisode: null,
-          watched: item.w || false,
-          watchedAt: null,
-          priority: item.p || false,
-          needsRefresh: true // Mark for immediate refresh
-        }));
+        // Handle both old format (object) and new format (array)
+        const rebuiltShows = missingIds.map(item => {
+          // New compressed format: [id, name, type, watched, priority]
+          if (Array.isArray(item)) {
+            return {
+              id: item[0],
+              name: item[1] || "Loading...",
+              contentType: item[2] === "m" ? "movies" : (item[2] === "a" ? "anime" : "tv"),
+              image: null,
+              genres: [],
+              status: "Unknown",
+              summary: "",
+              nextEpisode: null,
+              watched: item[3] === 1,
+              watchedAt: null,
+              priority: item[4] === 1,
+              needsRefresh: true
+            };
+          }
+          // Old format: { id, n, t, w, p }
+          return {
+            id: item.id,
+            name: item.n || "Loading...",
+            contentType: item.t || "tv",
+            image: null,
+            genres: [],
+            status: "Unknown",
+            summary: "",
+            nextEpisode: null,
+            watched: item.w || false,
+            watchedAt: null,
+            priority: item.p || false,
+            needsRefresh: true
+          };
+        });
 
         // Merge with local and save
         const merged = [...localShows, ...rebuiltShows];
         await chrome.storage.local.set({ [localKey]: merged });
         console.log(`[getUserShows] ✅ Saved ${merged.length} shows to local (${rebuiltShows.length} rebuilt, ${localShows.length} existing)`);
+        if (isSupabaseUser(user) && isSupabaseConfigured()) {
+          const session = await getStoredSession();
+          const userId = user.userId || getSessionUserId(session);
+          await upsertSupabaseShows(userId, merged);
+        }
         return merged;
       } else if (localShows.length === 0 && syncedIds.length > 0) {
         // Edge case: sync has data but local is empty (shouldn't happen, but handle it)
         console.log(`[getUserShows] ⚠️ Local empty but sync has ${syncedIds.length} shows - rebuilding all...`);
-        const rebuiltShows = syncedIds.map(item => ({
-          id: item.id,
-          name: item.n || "Loading...",
-          contentType: item.t || "tv",
-          image: null,
-          genres: [],
-          status: "Unknown",
-          summary: "",
-          nextEpisode: null,
-          watched: item.w || false,
-          watchedAt: null,
-          priority: item.p || false,
-          needsRefresh: true
-        }));
+        // Handle both old format (object) and new format (array)
+        const rebuiltShows = syncedIds.map(item => {
+          // New compressed format: [id, name, type, watched, priority]
+          if (Array.isArray(item)) {
+            return {
+              id: item[0],
+              name: item[1] || "Loading...",
+              contentType: item[2] === "m" ? "movies" : (item[2] === "a" ? "anime" : "tv"),
+              image: null,
+              genres: [],
+              status: "Unknown",
+              summary: "",
+              nextEpisode: null,
+              watched: item[3] === 1,
+              watchedAt: null,
+              priority: item[4] === 1,
+              needsRefresh: true
+            };
+          }
+          // Old format: { id, n, t, w, p }
+          return {
+            id: item.id,
+            name: item.n || "Loading...",
+            contentType: item.t || "tv",
+            image: null,
+            genres: [],
+            status: "Unknown",
+            summary: "",
+            nextEpisode: null,
+            watched: item.w || false,
+            watchedAt: null,
+            priority: item.p || false,
+            needsRefresh: true
+          };
+        });
         await chrome.storage.local.set({ [localKey]: rebuiltShows });
         console.log(`[getUserShows] ✅ Rebuilt all ${rebuiltShows.length} shows from sync`);
+        if (isSupabaseUser(user) && isSupabaseConfigured()) {
+          const session = await getStoredSession();
+          const userId = user.userId || getSessionUserId(session);
+          await upsertSupabaseShows(userId, rebuiltShows);
+        }
         return rebuiltShows;
       }
     } else if (localShows.length === 0) {
-      console.log(`[getUserShows] ⚠️ No sync data and no local shows - user has no shows yet`);
+      console.log(`[getUserShows] ⚠️ No remote data and no local shows - user has no shows yet`);
     }
 
     return localShows;
@@ -320,12 +543,18 @@ async function getUserShows(specificUser = null) {
 // Optimized: sync gets minimal data (ID, name initial, type, watched, priority)
 // Local gets full data
 async function saveUserShows(shows, specificUser = null) {
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:333',message:'saveUserShows entry',data:{showCount:shows?.length||0},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H3'})}).catch(()=>{});
+  // #endregion
   try {
     let user = specificUser;
     if (!user) {
       const userData = await getStorageData("currentUser");
       user = userData.currentUser || currentUser;
     }
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:340',message:'saveUserShows user resolved',data:{email:user?.email,userId:user?.userId,googleId:user?.googleId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+    // #endregion
 
     const { key: userKey } = await ensureUserStorageKey(user);
     if (!userKey) {
@@ -333,50 +562,39 @@ async function saveUserShows(shows, specificUser = null) {
       return;
     }
 
-    const syncKey = `${userKey}_ids`;
     const localKey = userKey;
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:348',message:'saveUserShows keys generated',data:{localKey:localKey,userEmail:user?.email,userId:user?.userId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+    // #endregion
 
     // Save full data locally
     await chrome.storage.local.set({ [localKey]: shows });
 
-    // Save minimal data to sync (each item ~30 bytes, can fit ~250 shows in 8KB)
-    // Format: { id, n: first 20 chars of name, t: contentType, w: watched, p: priority }
-    const minimalShows = shows.map(s => ({
-      id: s.id,
-      n: (s.name || "").slice(0, 20),
-      t: s.contentType || "tv",
-      w: s.watched || false,
-      p: s.priority || false
-    }));
-
-    // Only sync if user has email (not guest)
-    if (user && user.email) {
-      try {
-        await chrome.storage.sync.set({ [syncKey]: minimalShows });
-        console.log(`[saveUserShows] ✅ Synced ${minimalShows.length} shows to ${syncKey}`);
-        
-        // Verify sync worked
-        const verify = await chrome.storage.sync.get(syncKey);
-        if (verify[syncKey] && verify[syncKey].length === minimalShows.length) {
-          console.log(`[saveUserShows] ✅ Sync verified: ${verify[syncKey].length} shows in cloud`);
-        } else {
-          console.warn(`[saveUserShows] ⚠️ Sync verification failed! Expected ${minimalShows.length}, got ${verify[syncKey]?.length || 0}`);
-        }
-      } catch (syncErr) {
-        console.error("[saveUserShows] ❌ Sync failed:", syncErr);
-        if (syncErr.message?.includes("QUOTA_BYTES")) {
-          console.error("[saveUserShows] Sync storage quota exceeded! Try removing some shows.");
-        }
+    // Save minimal data to Supabase (per-user rows)
+    if (isSupabaseUser(user) && isSupabaseConfigured()) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:373',message:'saveUserShows before supabase upsert',data:{userId:user.userId,showCount:shows.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'S4'})}).catch(()=>{});
+      // #endregion
+      const session = await getStoredSession();
+      const userId = user.userId || getSessionUserId(session);
+      const { error } = await upsertSupabaseShows(userId, shows);
+      if (error) {
+        console.error("[saveUserShows] ❌ Supabase upsert failed:", error);
+      } else {
+        console.log(`[saveUserShows] ✅ Supabase upserted ${shows.length} shows`);
       }
     } else {
-      console.log(`[saveUserShows] ⚠️ Skipping sync (guest user - no email)`);
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/36edecf3-da17-415d-8f72-bb2177cfe6bf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'popup.js:392',message:'saveUserShows skip supabase',data:{hasUser:!!user,source:user?.source||null,configured:isSupabaseConfigured()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'S4'})}).catch(()=>{});
+      // #endregion
+      console.log(`[saveUserShows] ⚠️ Skipping Supabase sync (guest or not configured)`);
     }
   } catch (err) {
     console.error("[saveUserShows] Error:", err);
   }
 }
 
-// Simple login functions - no OAuth2 required!
+// User session helpers
 async function getCurrentUser() {
   try {
     const result = await getStorageData("currentUser");
@@ -439,7 +657,7 @@ function updateUserButtonUI(user) {
   if (!userBtn) return;
 
   const isGuest = user && (user.source === "guest" || user.source === "simple");
-  const isSignedIn = user && user.email;
+  const isSignedIn = user && (user.source === "supabase" || user.email);
 
   if (isSignedIn) {
     if (user.picture) {
@@ -452,7 +670,7 @@ function updateUserButtonUI(user) {
       const initial = user.name ? user.name.charAt(0).toUpperCase() : "👤";
       userBtn.textContent = initial;
     }
-    userBtn.title = `Signed in as ${user.name} (${user.email})`;
+    userBtn.title = user.email ? `Signed in as ${user.name} (${user.email})` : `Signed in as ${user.name}`;
     userBtn.classList.add("signed-in");
   } else {
     userBtn.style.backgroundImage = "";
@@ -567,6 +785,11 @@ function showImportModal(importData) {
 
   if (!modal || !message) return;
 
+  if (!importData || !importData.shows || !Array.isArray(importData.shows)) {
+    console.error("Invalid import data:", importData);
+    return;
+  }
+
   const showCount = importData.shows.length;
   message.textContent = `This will import ${showCount} show(s). How would you like to proceed?`;
 
@@ -583,76 +806,176 @@ function hideImportModal() {
 }
 
 async function processImport(merge = false) {
-  if (!pendingImportData) return;
+  if (!pendingImportData || !pendingImportData.shows || !Array.isArray(pendingImportData.shows)) {
+    console.error("Invalid pending import data:", pendingImportData);
+    showToast("Invalid import data. Please try exporting again.", "error");
+    hideImportModal();
+    return;
+  }
 
   try {
+    // Validate that user is signed in
+    const user = await getCurrentUser();
+    if (!user) {
+      showToast("Please sign in to import shows.", "error");
+      hideImportModal();
+      return;
+    }
+
     const existingShows = await getUserShows();
     const showCount = pendingImportData.shows.length;
+
+    // Validate and clean imported shows
+    const validShows = pendingImportData.shows.filter(show => {
+      // Must have an ID
+      if (!show || !show.id) {
+        console.warn("Skipping invalid show (missing ID):", show);
+        return false;
+      }
+      return true;
+    }).map(show => {
+      // Ensure required fields exist with defaults
+      return {
+        ...show,
+        id: String(show.id), // Ensure ID is a string
+        name: show.name || "Unknown Show",
+        contentType: show.contentType || "tv",
+        watched: show.watched || false,
+        priority: show.priority || false,
+        genres: Array.isArray(show.genres) ? show.genres : [],
+        status: show.status || "Unknown",
+        summary: show.summary || "",
+        // Mark for refresh if episode data is missing or stale
+        needsRefresh: !show.nextEpisode || !show.allEpisodesLastFetchedAt || isFetchStale(show.allEpisodesLastFetchedAt)
+      };
+    });
+
+    if (validShows.length === 0) {
+      showToast("No valid shows found in import file.", "error");
+      hideImportModal();
+      return;
+    }
 
     let finalShows;
     if (merge) {
       // Merge: combine existing and imported, avoiding duplicates
-      const existingIds = new Set(existingShows.map(s => s.id));
-      const newShows = pendingImportData.shows.filter(s => !existingIds.has(s.id));
+      const existingIds = new Set(existingShows.map(s => String(s.id)));
+      const newShows = validShows.filter(s => !existingIds.has(String(s.id)));
       finalShows = [...existingShows, ...newShows];
       showToast(`Merged ${newShows.length} new show(s) with ${existingShows.length} existing show(s).`);
     } else {
       // Replace
-      finalShows = pendingImportData.shows;
-      showToast(`Replaced all shows with ${showCount} imported show(s).`);
+      finalShows = validShows;
+      showToast(`Replaced all shows with ${validShows.length} imported show(s).`);
     }
 
+    // Save the shows
     await saveUserShows(finalShows);
+    console.log(`[processImport] ✅ Saved ${finalShows.length} shows successfully`);
 
     // Refresh the UI
     const container = document.getElementById("shows-container");
     if (container) {
-      loadAndRenderShows(container);
+      await loadAndRenderShows(container);
+    }
+
+    // If any shows need refresh, trigger background refresh
+    const needsRefresh = finalShows.some(s => s.needsRefresh);
+    if (needsRefresh) {
+      console.log("[processImport] 🔄 Some shows need refresh, triggering background update...");
+      refreshStaleShows(finalShows).then(() => {
+        // Reload after refresh completes
+        if (container) {
+          loadAndRenderShows(container);
+        }
+      });
     }
 
     hideImportModal();
     hideProfileMenu();
   } catch (err) {
     console.error("Import error:", err);
-    showToast("Failed to import shows. Please try again.", "error");
+    showToast(`Failed to import shows: ${err.message || "Unknown error"}. Please try again.`, "error");
     hideImportModal();
   }
 }
 
 async function handleFileImport(event) {
   const file = event.target.files[0];
-  if (!file) return;
+  if (!file) {
+    console.warn("[handleFileImport] No file selected");
+    return;
+  }
+
+  // Validate file type
+  if (!file.name.endsWith('.json')) {
+    showToast("Please select a JSON file (.json).", "error");
+    event.target.value = "";
+    return;
+  }
 
   try {
     const text = await file.text();
-    const importData = JSON.parse(text);
+    if (!text || text.trim().length === 0) {
+      showToast("The file is empty. Please export a valid backup file first.", "error");
+      event.target.value = "";
+      return;
+    }
 
-    // Validate the import data
-    if (!importData.shows || !Array.isArray(importData.shows)) {
+    let importData;
+    try {
+      importData = JSON.parse(text);
+    } catch (parseErr) {
+      console.error("[handleFileImport] JSON parse error:", parseErr);
+      showToast("Invalid JSON file. Please check the file and try again.", "error");
+      event.target.value = "";
+      return;
+    }
+
+    // Validate the import data structure
+    if (!importData || typeof importData !== 'object') {
       showToast("Invalid file format. Please export a valid backup file first.", "error");
       event.target.value = "";
       return;
     }
 
-    const showCount = importData.shows.length;
-    if (showCount === 0) {
+    // Support both old format (direct shows array) and new format (object with shows property)
+    let shows = null;
+    if (Array.isArray(importData)) {
+      // Old format: direct array
+      shows = importData;
+    } else if (importData.shows && Array.isArray(importData.shows)) {
+      // New format: object with shows property
+      shows = importData.shows;
+    } else {
+      showToast("Invalid file format. Expected a backup file with shows array.", "error");
+      event.target.value = "";
+      return;
+    }
+
+    if (shows.length === 0) {
       showToast("The file contains no shows.", "error");
       event.target.value = "";
       return;
     }
 
+    // Normalize to expected format
+    const normalizedData = {
+      version: importData.version || "1.0",
+      exportedAt: importData.exportedAt || new Date().toISOString(),
+      shows: shows
+    };
+
+    console.log(`[handleFileImport] ✅ Loaded ${shows.length} shows from file`);
+
     // Show custom modal instead of confirm dialog
-    showImportModal(importData);
+    showImportModal(normalizedData);
 
     // Reset file input
     event.target.value = "";
   } catch (err) {
-    console.error("Import error:", err);
-    if (err instanceof SyntaxError) {
-      showToast("Invalid JSON file. Please check the file and try again.", "error");
-    } else {
-      showToast("Failed to import shows. Please try again.", "error");
-    }
+    console.error("[handleFileImport] Import error:", err);
+    showToast(`Failed to read file: ${err.message || "Unknown error"}. Please try again.`, "error");
     event.target.value = "";
   }
 }
@@ -662,10 +985,8 @@ function showLoginModal() {
   if (modal) {
     modal.style.display = "flex";
 
-    // Check if identity API is available before showing
-    if (!chrome.identity || !chrome.identity.getAuthToken) {
-      console.warn("Chrome Identity API not available");
-      showToast("Identity API not available. Please reload the extension.", "error");
+    if (!isSupabaseConfigured()) {
+      showToast("Supabase is not configured. Set URL and anon key first.", "error");
       setTimeout(() => hideLoginModal(), 2000);
       return;
     }
@@ -679,206 +1000,209 @@ function hideLoginModal() {
   }
 }
 
-async function handleGoogleSignIn() {
+// Email + Password Sign In
+async function handleEmailSignIn() {
   try {
+    if (!isSupabaseConfigured()) {
+      showToast("Supabase is not configured.", "error");
+      return;
+    }
+
+    const emailInput = document.getElementById("auth-email");
+    const passwordInput = document.getElementById("auth-password");
+    const email = emailInput ? emailInput.value.trim() : "";
+    const password = passwordInput ? passwordInput.value : "";
+
+    if (!email || !email.includes("@")) {
+      showToast("Enter a valid email address.", "error");
+      return;
+    }
+    if (!password || password.length < 6) {
+      showToast("Password must be at least 6 characters.", "error");
+      return;
+    }
+
     showToast("Signing in...", "success");
 
-    let user = null;
+    const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ email, password })
+    });
 
-    if (chrome.identity && chrome.identity.getProfileUserInfo) {
-      try {
-        const profileInfo = await new Promise((resolve, reject) => {
-          chrome.identity.getProfileUserInfo((userInfo) => {
-            if (chrome.runtime.lastError) {
-              resolve(null);
-            } else {
-              resolve(userInfo);
-            }
-          });
-        });
-
-        if (profileInfo && profileInfo.email) {
-          user = {
-            name: profileInfo.email.split("@")[0] || "User",
-            email: profileInfo.email,
-            picture: null,
-            googleId: profileInfo.id || null,
-            token: null,
-            source: "chrome_profile"
-          };
-        }
-      } catch (profileErr) {
-        console.log("Profile info check failed:", profileErr);
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      console.error("[handleEmailSignIn] Failed:", response.status, err);
+      if (err.error_description?.includes("Invalid login")) {
+        showToast("Invalid email or password.", "error");
+      } else if (err.msg?.includes("not confirmed")) {
+        showToast("Email not confirmed. Check your inbox or create a new account.", "error");
+      } else {
+        showToast(err.msg || err.error_description || "Sign in failed.", "error");
       }
+      return;
     }
 
-    if (!user && chrome.identity && chrome.identity.getAuthToken) {
-      try {
-        const token = await new Promise((resolve, reject) => {
-          chrome.identity.getAuthToken({ interactive: true }, (token) => {
-            if (chrome.runtime.lastError) {
-              if (chrome.runtime.lastError.message?.match(/canceled|user_cancelled|did not approve/i)) {
-                reject(new Error("CANCELLED"));
-              } else {
-                resolve(null);
-              }
-            } else {
-              resolve(token);
-            }
-          });
-        });
+    const data = await response.json();
+    await handleAuthSuccess(data);
+  } catch (err) {
+    console.error("[handleEmailSignIn] Error:", err);
+    showToast("Sign in failed. Please try again.", "error");
+  }
+}
 
-        if (token) {
-          const response = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-            headers: { Authorization: `Bearer ${token}` }
-          });
-
-          if (response.ok) {
-            const userInfo = await response.json();
-            if (userInfo && (userInfo.name || userInfo.email)) {
-              user = {
-                name: userInfo.name || userInfo.email?.split("@")[0] || "User",
-                email: userInfo.email || null,
-                picture: userInfo.picture || null,
-                googleId: userInfo.id || null,
-                token: token,
-                source: "oauth"
-              };
-            }
-          }
-        }
-      } catch (oauthErr) {
-        if (oauthErr.message === "CANCELLED") {
-          hideLoginModal();
-          return;
-        }
-        console.log("OAuth flow failed, falling back to storage:", oauthErr);
-      }
+// Email + Password Sign Up (create account)
+async function handleEmailSignUp() {
+  try {
+    if (!isSupabaseConfigured()) {
+      showToast("Supabase is not configured.", "error");
+      return;
     }
 
-    // If we still don't have a user with email, sign-in failed
-    if (!user || !user.email) {
-      showToast("Sign-in failed. Make sure you're signed into Chrome with a Google account.", "error");
+    const emailInput = document.getElementById("auth-email");
+    const passwordInput = document.getElementById("auth-password");
+    const email = emailInput ? emailInput.value.trim() : "";
+    const password = passwordInput ? passwordInput.value : "";
+
+    if (!email || !email.includes("@")) {
+      showToast("Enter a valid email address.", "error");
+      return;
+    }
+    if (!password || password.length < 6) {
+      showToast("Password must be at least 6 characters.", "error");
+      return;
+    }
+
+    showToast("Creating account...", "success");
+
+    const response = await fetch(`${SUPABASE_URL}/auth/v1/signup`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ email, password })
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      console.error("[handleEmailSignUp] Failed:", response.status, err);
+      if (err.msg?.includes("already registered")) {
+        showToast("Email already registered. Try signing in.", "error");
+      } else {
+        showToast(err.msg || err.error_description || "Sign up failed.", "error");
+      }
+      return;
+    }
+
+    const data = await response.json();
+    
+    // Check if email confirmation is required
+    if (data.user && !data.access_token) {
+      showToast("Account created! Check email to confirm, then sign in.", "success");
       hideLoginModal();
       return;
     }
 
-    user = await mergeWithStoredUser(user);
-
-    const { user: ensuredUser, key: userKey } = await ensureUserStorageKey(user);
-    if (ensuredUser) {
-      user = ensuredUser;
+    // Auto sign-in if no confirmation needed
+    if (data.access_token) {
+      await handleAuthSuccess(data);
+    } else {
+      showToast("Account created! You can now sign in.", "success");
+      hideLoginModal();
     }
+  } catch (err) {
+    console.error("[handleEmailSignUp] Error:", err);
+    showToast("Sign up failed. Please try again.", "error");
+  }
+}
 
-    await migratePrevUserToNewUser(user);
+// Common handler for successful auth
+async function handleAuthSuccess(data) {
+  const session = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_at: data.expires_at || (Date.now() / 1000 + (data.expires_in || 3600))
+  };
+  await chrome.storage.local.set({ [SUPABASE_SESSION_KEY]: session });
+
+  const supaUser = data.user || {};
+  let user = {
+    name: supaUser.user_metadata?.full_name || supaUser.email?.split("@")[0] || "User",
+    email: supaUser.email || null,
+    picture: supaUser.user_metadata?.avatar_url || null,
+    googleId: null,
+    userId: supaUser.id || null,
+    token: null,
+    source: "supabase"
+  };
+
+  user = await mergeWithStoredUser(user);
+  const { user: ensuredUser } = await ensureUserStorageKey(user);
+  if (ensuredUser) user = ensuredUser;
+
+  await migratePrevUserToNewUser(user);
+  await setCurrentUser(user);
+  currentUser = user;
+  updateUserButtonUI(user);
+  hideLoginModal();
+  showToast(`Signed in as ${user.name}`);
+
+  const container = document.getElementById("shows-container");
+  if (container && currentView === "my-shows") {
+    loadAndRenderShows(container);
+  }
+}
+
+async function initSupabaseAuth() {
+  if (!isSupabaseConfigured()) return;
+
+  const session = await getStoredSession();
+  if (!isSessionValid(session)) {
+    return;
+  }
+
+  const supaUser = await fetchSupabaseUser(session);
+  if (supaUser) {
+    const user = buildSupabaseUser(supaUser);
     await setCurrentUser(user);
     currentUser = user;
     updateUserButtonUI(user);
-    hideLoginModal();
-    showToast(`Signed in as ${user.name}`);
-
-    await migrateStorageIfNeeded();
-
-    const container = document.getElementById("shows-container");
-    if (container && currentView === "my-shows") {
-      loadAndRenderShows(container);
-    }
-  } catch (err) {
-    console.error("Google Sign-In error:", err);
-
-    // Handle specific error cases
-    if (err.message === "CANCELLED") {
-      hideLoginModal();
-      return; // Silently return if user cancelled
-    }
-
-    if (err.message === "OAUTH_NOT_CONFIGURED") {
-      try {
-        let user = null;
-
-        if (chrome.identity && chrome.identity.getProfileUserInfo) {
-          const profileInfo = await new Promise((resolve) => {
-            chrome.identity.getProfileUserInfo((userInfo) => {
-              resolve(chrome.runtime.lastError ? null : userInfo);
-            });
-          });
-          if (profileInfo && profileInfo.email) {
-            user = {
-              name: profileInfo.email.split("@")[0] || "User",
-              email: profileInfo.email,
-              picture: null,
-              googleId: profileInfo.id || null,
-              token: null,
-              source: "chrome_profile"
-            };
-          }
-        }
-
-        if (!user || !user.email) {
-          showToast("Sign-in failed. Make sure you're signed into Chrome with a Google account.", "error");
-          hideLoginModal();
-          return;
-        }
-
-        user = await mergeWithStoredUser(user);
-        const { user: ensuredUser } = await ensureUserStorageKey(user);
-        if (ensuredUser) user = ensuredUser;
-
-        await migratePrevUserToNewUser(user);
-        await setCurrentUser(user);
-        currentUser = user;
-        updateUserButtonUI(user);
-        hideLoginModal();
-        showToast(`Signed in as ${user.name} (${user.email})`);
-
-        await migrateStorageIfNeeded();
-
-        const container = document.getElementById("shows-container");
-        if (container && currentView === "my-shows") {
-          loadAndRenderShows(container);
-        }
-        return;
-      } catch (fallbackErr) {
-        console.error("Fallback sign-in failed:", fallbackErr);
-      }
-    }
-
-    // Show error message
-    let errorMessage = "Failed to sign in. Please try again.";
-    if (err.message && !err.message.includes("CANCELLED")) {
-      errorMessage = err.message;
-    }
-
-    showToast(errorMessage, "error");
   }
 }
 
 async function handleLogout() {
   try {
-    // Get stored user to revoke token
     const user = await getCurrentUser();
 
-    if (user && user.token) {
-      // Revoke the Google OAuth token
-      chrome.identity.removeCachedAuthToken({ token: user.token }, () => {
-        // Continue with logout even if revoke fails
-        clearCurrentUser();
-        updateUserButtonUI(null);
-        hideLogoutModal();
-        showToast("Signed out");
-      });
-    } else {
-      // No token to revoke, just clear user
-      await clearCurrentUser();
-      updateUserButtonUI(null);
-      hideLogoutModal();
-      showToast("Signed out");
+    if (isSupabaseUser(user) && isSupabaseConfigured()) {
+      const session = await getStoredSession();
+      if (session?.access_token) {
+        await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+          method: "POST",
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${session.access_token}`
+          }
+        });
+      }
     }
+
+    await clearStoredSession();
+    await clearCurrentUser();
+    const guest = await ensureGuestUser();
+    updateUserButtonUI(guest);
+    hideLogoutModal();
+    showToast("Signed out");
   } catch (err) {
     console.error("Logout error:", err);
     // Still clear user even if revoke fails
     await clearCurrentUser();
-    updateUserButtonUI(null);
+    const guest = await ensureGuestUser();
+    updateUserButtonUI(guest);
     hideLogoutModal();
     showToast("Signed out");
   }
@@ -1184,7 +1508,7 @@ async function migrateStorageIfNeeded() {
 
     // Check for old "shows" key
     const oldData = await getStorageData("shows");
-    const hasOldShows = oldData.shows && Array.isArray(oldData.shows) && oldData.shows.length > 0;
+    const hasOldShows = oldData && oldData.shows && Array.isArray(oldData.shows) && oldData.shows.length > 0;
 
     // Check if user already has shows
     const userShows = await getUserShows();
@@ -1204,28 +1528,42 @@ async function migrateStorageIfNeeded() {
   }
 }
 
+// Real-time sync listener - detects when sync data arrives from another device
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === 'sync') {
+    // Check if any show sync keys changed
+    const showKeys = Object.keys(changes).filter(k => k.includes('shows_') && k.includes('_ids'));
+    if (showKeys.length > 0) {
+      console.log(`[sync] Detected sync update for keys:`, showKeys);
+      // Check if this is for the current user
+      if (currentUser && currentUser.email) {
+        const userKey = getUserShowsKey(currentUser);
+        const syncKey = `${userKey}_ids`;
+        if (showKeys.includes(syncKey)) {
+          console.log(`[sync] ✅ Sync data arrived for current user! Reloading shows...`);
+          // Reload shows immediately
+          const container = document.getElementById("shows-container");
+          if (container && currentView === "my-shows") {
+            loadAndRenderShows(container);
+          }
+        }
+      }
+    }
+  }
+});
+
 document.addEventListener("DOMContentLoaded", async () => {
   // Migrate storage first (one-time operation)
   await migrateStorageIfNeeded();
 
   // Initialize user (wrap in try-catch to prevent blocking other initialization)
   try {
+    await initSupabaseAuth();
     currentUser = await getCurrentUser();
 
     // Auto-create guest user if no user exists (allows import/add without login)
     if (!currentUser) {
-      const guestUserId = generateUserId();
-      currentUser = {
-        name: "Guest",
-        email: null,
-        picture: null,
-        googleId: null,
-        userId: guestUserId,
-        token: null,
-        source: "guest"
-      };
-      await setCurrentUser(currentUser);
-      await setStorageData({ simpleUser: currentUser });
+      currentUser = await ensureGuestUser();
     }
 
     updateUserButtonUI(currentUser);
@@ -1285,7 +1623,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     profileSigninBtn.addEventListener("click", () => {
       hideProfileMenu();
       // Check if user is actually signed in (has email) vs guest
-      const isSignedIn = currentUser && currentUser.email;
+      const isSignedIn = currentUser && (currentUser.source === "supabase" || currentUser.email);
       if (isSignedIn) {
         showLogoutModal();
       } else {
@@ -1349,16 +1687,32 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
-  // Handle login modal
-  const googleSignInBtn = document.getElementById("google-signin-btn");
+  // Handle login modal (email + password)
+  const authSignInBtn = document.getElementById("auth-signin-btn");
+  const authSignUpBtn = document.getElementById("auth-signup-btn");
   const loginCancelBtn = document.getElementById("login-cancel-btn");
 
-  if (googleSignInBtn) {
-    googleSignInBtn.addEventListener("click", handleGoogleSignIn);
+  if (authSignInBtn) {
+    authSignInBtn.addEventListener("click", handleEmailSignIn);
+  }
+
+  if (authSignUpBtn) {
+    authSignUpBtn.addEventListener("click", handleEmailSignUp);
   }
 
   if (loginCancelBtn) {
     loginCancelBtn.addEventListener("click", hideLoginModal);
+  }
+  
+  // Allow Enter key to sign in
+  const authPassword = document.getElementById("auth-password");
+  if (authPassword) {
+    authPassword.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        handleEmailSignIn();
+      }
+    });
   }
 
   // Close modal when clicking outside
@@ -1402,7 +1756,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       switchView(currentView, false);
     } else {
       // Always load shows on startup, regardless of login status
-      // Shows are stored globally in chrome.storage.sync (tied to Chrome account)
+      // Shows are synced via Supabase and cached locally
       loadAndRenderShows(showsContainer);
     }
   });
@@ -2214,7 +2568,7 @@ async function loadAndRenderShows(container) {
       return;
     }
 
-    // Load shows for current user (syncs across devices via chrome.storage.sync)
+    // Load shows for current user (syncs across devices via Supabase)
     // First check if user is logged in by checking storage directly
     const userData = await getStorageData("currentUser");
     let user = userData.currentUser || currentUser;
@@ -2262,7 +2616,31 @@ async function loadAndRenderShows(container) {
     let shows = await getUserShows();
 
     const userLabel = user.email || user.googleId || user.userId || "unknown";
-    console.log(`[loadAndRenderShows] User: ${userLabel}, Shows count: ${shows.length}`);
+    const isSignedIn = user && (user.source === "supabase" || user.email || user.googleId || (user.userId && user.source !== "guest"));
+    console.log(`[loadAndRenderShows] User: ${userLabel}, Signed in: ${isSignedIn}, Shows count: ${shows.length}`);
+    
+    // Debug: Log if shows are empty but user is signed in
+    if (shows.length === 0 && isSignedIn) {
+      const userInfo = {
+        email: user.email || null,
+        googleId: user.googleId || null,
+        userId: user.userId || null,
+        source: user.source || null,
+        name: user.name || null
+      };
+      console.warn(`[loadAndRenderShows] ⚠️ Signed-in user has no shows! User info:`, userInfo);
+      // Check storage directly to see if data exists
+      const userKey = await ensureUserStorageKey(user);
+      if (userKey.key) {
+        const directCheck = await chrome.storage.local.get(userKey.key);
+        let remoteCount = 0;
+        if (isSupabaseUser(user) && isSupabaseConfigured()) {
+          const { rows } = await fetchSupabaseShows(user.userId);
+          remoteCount = rows.length;
+        }
+        console.log(`[loadAndRenderShows] Direct storage check - Local:`, directCheck[userKey.key]?.length || 0, `Remote:`, remoteCount);
+      }
+    }
 
     // Check if any shows need immediate refresh (synced from another device)
     const needsRefresh = shows.some(s => s.needsRefresh);
@@ -2276,7 +2654,28 @@ async function loadAndRenderShows(container) {
 
     // Render shows immediately (even if they need refresh)
     if (!filteredShows.length && currentStatusFilter === "all") {
-      renderShows(container, SAMPLE_SHOWS, { interactive: false });
+      // Check if user is signed in (not guest) - check for any identifier
+      const isSignedIn = user && (user.source === "supabase" || user.email || user.googleId || (user.userId && user.source !== "guest"));
+      
+      if (isSignedIn) {
+        // User is signed in but has no shows - might be waiting for sync
+        container.innerHTML = "";
+        const empty = document.createElement("div");
+        empty.className = "card show-card";
+        empty.innerHTML = `
+          <div style="text-align: center; padding: 20px;">
+            <p>No shows yet. Add some shows to get started!</p>
+            <p style="font-size: 12px; color: #888; margin-top: 10px;">
+              If you added shows on another device, they should sync automatically. 
+              Make sure Chrome sync is enabled in your browser settings.
+            </p>
+          </div>
+        `;
+        container.appendChild(empty);
+      } else {
+        // Guest user - show sample shows
+        renderShows(container, SAMPLE_SHOWS, { interactive: false });
+      }
     } else if (!filteredShows.length) {
       container.innerHTML = "";
       const empty = document.createElement("div");
@@ -3219,9 +3618,8 @@ async function handleMyShowsInfiniteScroll() {
   const container = document.getElementById("shows-container");
   if (!container) return;
 
-  // Get all shows to check if there's more
-  const stored = await chrome.storage.sync.get("shows");
-  const shows = Array.isArray(stored.shows) ? stored.shows : [];
+  // Get all shows to check if there's more (use user-specific storage)
+  const shows = await getUserShows();
 
   if (!shows.length) return;
 

@@ -124,18 +124,58 @@ export async function searchShowsByGenreWithPopularity(genre) {
     .map(({ popularityScore, ...rest }) => rest);
 }
 
+async function fetchWithRetry(url, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = await fetch(url);
+      
+      // Rate limiting - wait and retry
+      if (res.status === 429) {
+        const retryAfter = res.headers.get('Retry-After') || 2;
+        if (i < retries) {
+          console.log(`[TVmaze] Rate limited, retrying after ${retryAfter}s...`);
+          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+          continue;
+        }
+      }
+      
+      // Server errors - retry
+      if (res.status >= 500 && i < retries) {
+        console.log(`[TVmaze] Server error ${res.status}, retrying...`);
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+        continue;
+      }
+      
+      return res;
+    } catch (err) {
+      if (i < retries) {
+        console.log(`[TVmaze] Network error, retrying...`, err);
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export async function searchShows(query) {
   const trimmed = query.trim();
   if (!trimmed) return [];
 
   try {
     // Try exact search first
-    let res = await fetch(
+    let res = await fetchWithRetry(
       `${TVMAZE_BASE_URL}/search/shows?q=${encodeURIComponent(trimmed)}`
     );
 
     if (!res.ok) {
-      console.error("TVmaze search failed", res.status);
+      if (res.status === 429) {
+        console.warn("[TVmaze] Rate limit exceeded. Please wait a moment and try again.");
+      } else if (res.status >= 500) {
+        console.error("[TVmaze] Server error:", res.status);
+      } else {
+        console.error("[TVmaze] Search failed:", res.status);
+      }
       return [];
     }
 
@@ -207,11 +247,11 @@ export async function searchShows(query) {
       const words = trimmed.split(/\s+/).filter(w => w.length > 2);
       if (words.length > 0) {
         const partialQuery = words.map(w => w.slice(0, Math.max(3, Math.floor(w.length * 0.6)))).join(" ");
-        res = await fetch(
+        res = await fetchWithRetry(
           `${TVMAZE_BASE_URL}/search/shows?q=${encodeURIComponent(partialQuery)}`
         );
 
-        if (res.ok) {
+        if (res && res.ok) {
           const fuzzyData = await res.json();
           const fuzzyResults = fuzzyData
             .filter((item) => item.show)
@@ -246,21 +286,39 @@ export async function searchShows(query) {
 }
 
 export async function fetchShow(showId) {
-  const res = await fetch(`${TVMAZE_BASE_URL}/shows/${showId}`);
-  if (!res.ok) {
-    console.error("TVmaze show details failed", res.status);
+  try {
+    const res = await fetchWithRetry(`${TVMAZE_BASE_URL}/shows/${showId}`);
+    if (!res.ok) {
+      if (res.status === 404) {
+        console.warn(`[TVmaze] Show ${showId} not found`);
+      } else {
+        console.error(`[TVmaze] Show details failed:`, res.status);
+      }
+      return null;
+    }
+    return res.json();
+  } catch (err) {
+    console.error(`[TVmaze] Error fetching show ${showId}:`, err);
     return null;
   }
-  return res.json();
 }
 
 export async function fetchEpisodes(showId) {
-  const res = await fetch(`${TVMAZE_BASE_URL}/shows/${showId}/episodes`);
-  if (!res.ok) {
-    console.error("TVmaze episodes failed", res.status);
+  try {
+    const res = await fetchWithRetry(`${TVMAZE_BASE_URL}/shows/${showId}/episodes`);
+    if (!res.ok) {
+      if (res.status === 404) {
+        console.warn(`[TVmaze] Episodes for show ${showId} not found`);
+      } else {
+        console.error(`[TVmaze] Episodes failed:`, res.status);
+      }
+      return [];
+    }
+    return res.json();
+  } catch (err) {
+    console.error(`[TVmaze] Error fetching episodes for ${showId}:`, err);
     return [];
   }
-  return res.json();
 }
 
 export function computeNextEpisode(episodes) {

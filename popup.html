@@ -48,12 +48,28 @@
       <!-- Login Modal -->
       <div id="login-modal" class="login-modal" style="display: none;">
         <div class="login-modal-content">
-          <h3>Sign In with Google</h3>
-          <p>Sign in to sync your shows across devices</p>
+          <h3 id="login-modal-title">Sign In</h3>
+          <p id="login-modal-subtitle">Enter your email and password</p>
           <div class="login-modal-buttons" style="flex-direction: column; gap: 10px;">
-            <button id="google-signin-btn" class="login-btn" style="background: linear-gradient(135deg, #4285f4, #34a853); display: flex; align-items: center; justify-content: center; gap: 8px;">
-              <span>🔵</span>
-              <span>Sign in with Google</span>
+            <input
+              id="auth-email"
+              type="email"
+              placeholder="you@example.com"
+              class="search-input"
+              style="width: 100%;"
+            />
+            <input
+              id="auth-password"
+              type="password"
+              placeholder="Password (min 6 chars)"
+              class="search-input"
+              style="width: 100%;"
+            />
+            <button id="auth-signin-btn" class="login-btn" style="width: 100%;">
+              Sign In
+            </button>
+            <button id="auth-signup-btn" class="login-btn" style="width: 100%; background: linear-gradient(135deg, #9333ea, #7c3aed);">
+              Create Account
             </button>
             <button id="login-cancel-btn" class="login-btn-cancel">Cancel</button>
           </div>

@@ -22,10 +22,17 @@
   "host_permissions": [
     "https://api.tvmaze.com/*",
     "https://query.wikidata.org/*",
-    "https://www.googleapis.com/*"
+    "https://www.googleapis.com/*",
+    "https://*.supabase.co/*"
   ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["auth.html", "auth.js"],
+      "matches": ["https://*.chromiumapp.org/*"]
+    }
+  ]
 }

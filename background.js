@@ -89,20 +89,6 @@ async function refreshAllShows() {
     // Save full data to local
     await chrome.storage.local.set({ [userKey]: updated });
 
-    // Save minimal data to sync
-    const syncKey = `${userKey}_ids`;
-    const minimalShows = updated.map(s => ({
-      id: s.id,
-      n: (s.name || "").slice(0, 20),
-      t: s.contentType || "tv",
-      w: s.watched || false,
-      p: s.priority || false
-    }));
-
-    try {
-      await chrome.storage.sync.set({ [syncKey]: minimalShows });
-    } catch (e) {
-      // Sync limit reached, ignore
-    }
+    // Supabase sync happens in popup using the authenticated client
   }
 }
