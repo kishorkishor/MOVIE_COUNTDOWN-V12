@@ -208,9 +208,17 @@ async function getUserShows(specificUser = null) {
     let syncData = {};
     try {
       syncData = await chrome.storage.sync.get(syncKey);
-      console.log(`[getUserShows] Sync data:`, syncData[syncKey] ? `${syncData[syncKey].length} shows` : "none");
+      if (syncData[syncKey]) {
+        console.log(`[getUserShows] ✅ Found ${syncData[syncKey].length} shows in sync storage (${syncKey})`);
+      } else {
+        console.log(`[getUserShows] ⚠️ No sync data found for key: ${syncKey}`);
+        // Try to list all sync keys to debug
+        const allSync = await chrome.storage.sync.get(null);
+        const syncKeys = Object.keys(allSync).filter(k => k.includes('shows_') && k.includes('_ids'));
+        console.log(`[getUserShows] Available sync keys:`, syncKeys);
+      }
     } catch (e) {
-      console.log("Sync read failed, using local only:", e);
+      console.error("[getUserShows] Sync read failed:", e);
     }
 
     // Check for legacy mixed-case key if new key is empty
@@ -253,10 +261,33 @@ async function getUserShows(specificUser = null) {
       const missingIds = syncedIds.filter(item => !localShowIds.has(String(item.id)));
 
       if (missingIds.length > 0) {
-        console.log(`[getUserShows] Rebuilding ${missingIds.length} shows from sync...`);
+        console.log(`[getUserShows] 🔄 Rebuilding ${missingIds.length} shows from sync (local: ${localShows.length}, sync: ${syncedIds.length})...`);
         // Rebuild missing shows from synced minimal data
-        // User will see these and they'll be refreshed by refreshStaleShows
+        // User will see these and they'll be refreshed immediately
         const rebuiltShows = missingIds.map(item => ({
+          id: item.id,
+          name: item.n || "Loading...",
+          contentType: item.t || "tv",
+          image: null,
+          genres: [],
+          status: "Unknown",
+          summary: "",
+          nextEpisode: null,
+          watched: item.w || false,
+          watchedAt: null,
+          priority: item.p || false,
+          needsRefresh: true // Mark for immediate refresh
+        }));
+
+        // Merge with local and save
+        const merged = [...localShows, ...rebuiltShows];
+        await chrome.storage.local.set({ [localKey]: merged });
+        console.log(`[getUserShows] ✅ Saved ${merged.length} shows to local (${rebuiltShows.length} rebuilt, ${localShows.length} existing)`);
+        return merged;
+      } else if (localShows.length === 0 && syncedIds.length > 0) {
+        // Edge case: sync has data but local is empty (shouldn't happen, but handle it)
+        console.log(`[getUserShows] ⚠️ Local empty but sync has ${syncedIds.length} shows - rebuilding all...`);
+        const rebuiltShows = syncedIds.map(item => ({
           id: item.id,
           name: item.n || "Loading...",
           contentType: item.t || "tv",
@@ -270,13 +301,12 @@ async function getUserShows(specificUser = null) {
           priority: item.p || false,
           needsRefresh: true
         }));
-
-        // Merge with local and save
-        const merged = [...localShows, ...rebuiltShows];
-        await chrome.storage.local.set({ [localKey]: merged });
-        console.log(`[getUserShows] Total shows after rebuild: ${merged.length}`);
-        return merged;
+        await chrome.storage.local.set({ [localKey]: rebuiltShows });
+        console.log(`[getUserShows] ✅ Rebuilt all ${rebuiltShows.length} shows from sync`);
+        return rebuiltShows;
       }
+    } else if (localShows.length === 0) {
+      console.log(`[getUserShows] ⚠️ No sync data and no local shows - user has no shows yet`);
     }
 
     return localShows;
@@ -323,12 +353,23 @@ async function saveUserShows(shows, specificUser = null) {
     if (user && user.email) {
       try {
         await chrome.storage.sync.set({ [syncKey]: minimalShows });
-        console.log(`[saveUserShows] Synced ${minimalShows.length} shows to ${syncKey}`);
+        console.log(`[saveUserShows] ✅ Synced ${minimalShows.length} shows to ${syncKey}`);
+        
+        // Verify sync worked
+        const verify = await chrome.storage.sync.get(syncKey);
+        if (verify[syncKey] && verify[syncKey].length === minimalShows.length) {
+          console.log(`[saveUserShows] ✅ Sync verified: ${verify[syncKey].length} shows in cloud`);
+        } else {
+          console.warn(`[saveUserShows] ⚠️ Sync verification failed! Expected ${minimalShows.length}, got ${verify[syncKey]?.length || 0}`);
+        }
       } catch (syncErr) {
-        console.warn("Sync storage limit reached:", syncErr);
+        console.error("[saveUserShows] ❌ Sync failed:", syncErr);
+        if (syncErr.message?.includes("QUOTA_BYTES")) {
+          console.error("[saveUserShows] Sync storage quota exceeded! Try removing some shows.");
+        }
       }
     } else {
-      console.log(`[saveUserShows] Skipping sync (guest user)`);
+      console.log(`[saveUserShows] ⚠️ Skipping sync (guest user - no email)`);
     }
   } catch (err) {
     console.error("[saveUserShows] Error:", err);
@@ -2072,7 +2113,7 @@ async function refreshStaleShows(shows) {
       // Priority 1: Handle shows synced from another device that need full rebuild
       if (show.needsRefresh) {
         try {
-          console.log(`[refreshStaleShows] Rebuilding synced show: ${show.name || show.id}`);
+          console.log(`[refreshStaleShows] 🔄 Rebuilding synced show: ${show.name || show.id} (ID: ${show.id})`);
           const showInfo = await fetchShow(show.id);
           if (showInfo) {
             let updatedShow = {
@@ -2093,10 +2134,14 @@ async function refreshStaleShows(shows) {
               updatedShow.allEpisodesLastFetchedAt = new Date().toISOString();
             }
 
+            console.log(`[refreshStaleShows] ✅ Rebuilt show: ${updatedShow.name}`);
             return updatedShow;
+          } else {
+            console.warn(`[refreshStaleShows] ⚠️ No data returned for show ${show.id}`);
+            return show;
           }
         } catch (err) {
-          console.error(`Failed to rebuild synced show ${show.id}:`, err);
+          console.error(`[refreshStaleShows] ❌ Failed to rebuild synced show ${show.id}:`, err);
           return show;
         }
       }
@@ -2132,18 +2177,29 @@ async function refreshStaleShows(shows) {
       return show;
     }));
 
-    // Check if any show changed
-    const changed = results.some((newShow, index) => newShow !== shows[index]);
+    // Check if any show changed (compare by needsRefresh flag or object reference)
+    const changed = results.some((newShow, index) => {
+      const oldShow = shows[index];
+      return newShow !== oldShow || 
+             newShow.needsRefresh !== oldShow.needsRefresh ||
+             newShow.name !== oldShow.name ||
+             newShow.image !== oldShow.image;
+    });
 
     if (changed) {
+      console.log(`[refreshStaleShows] 💾 Saving ${results.length} updated shows...`);
       await saveUserShows(results);
+      console.log(`[refreshStaleShows] ✅ Shows saved successfully`);
 
       // Trigger re-render if we are still on the my-shows pages
       const container = document.getElementById("shows-container");
       if (container && currentView === "my-shows") {
+        console.log(`[refreshStaleShows] 🔄 Re-rendering shows...`);
         // Re-load
         loadAndRenderShows(container);
       }
+    } else {
+      console.log(`[refreshStaleShows] ℹ️ No changes detected, skipping save`);
     }
   } finally {
     isRefreshingStale = false;
@@ -2208,24 +2264,45 @@ async function loadAndRenderShows(container) {
     const userLabel = user.email || user.googleId || user.userId || "unknown";
     console.log(`[loadAndRenderShows] User: ${userLabel}, Shows count: ${shows.length}`);
 
-    // Trigger background refresh for stale shows or passed episodes
-    refreshStaleShows(shows);
-
-    // Apply status filter
+    // Check if any shows need immediate refresh (synced from another device)
+    const needsRefresh = shows.some(s => s.needsRefresh);
+    const needsRefreshCount = shows.filter(s => s.needsRefresh).length;
+    
+    // Apply status filter first
+    let filteredShows = shows;
     if (currentStatusFilter !== "all") {
-      shows = shows.filter(show => show.status === currentStatusFilter);
+      filteredShows = shows.filter(show => show.status === currentStatusFilter);
     }
 
-    if (!shows.length && currentStatusFilter === "all") {
+    // Render shows immediately (even if they need refresh)
+    if (!filteredShows.length && currentStatusFilter === "all") {
       renderShows(container, SAMPLE_SHOWS, { interactive: false });
-    } else if (!shows.length) {
+    } else if (!filteredShows.length) {
       container.innerHTML = "";
       const empty = document.createElement("div");
       empty.className = "card show-card";
       empty.textContent = `No ${currentStatusFilter.toLowerCase()} shows found.`;
       container.appendChild(empty);
     } else {
-      renderShows(container, shows, { interactive: true });
+      renderShows(container, filteredShows, { interactive: true });
+    }
+    
+    // Then refresh if needed (in background, will re-render when done)
+    if (needsRefresh && needsRefreshCount > 0) {
+      console.log(`[loadAndRenderShows] 🔄 Refreshing ${needsRefreshCount} shows in background...`);
+      refreshStaleShows(shows).then(() => {
+        // After refresh completes, reload and re-render
+        getUserShows().then(updatedShows => {
+          let updatedFiltered = updatedShows;
+          if (currentStatusFilter !== "all") {
+            updatedFiltered = updatedShows.filter(show => show.status === currentStatusFilter);
+          }
+          renderShows(container, updatedFiltered, { interactive: true });
+        });
+      });
+    } else {
+      // Trigger background refresh for stale shows or passed episodes
+      refreshStaleShows(shows);
     }
   } catch (err) {
     console.error("[loadAndRenderShows] Error:", err);
